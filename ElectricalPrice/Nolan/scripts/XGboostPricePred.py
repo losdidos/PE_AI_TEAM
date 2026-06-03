@@ -150,6 +150,7 @@ ax.set_ylabel('Actual (EUR/MWh)')
 ax.set_title('Actual vs Predicted')
 ax.legend()
 plt.tight_layout()
+plt.savefig(r'C:\Users\nolan\OneDrive\Desktop\PE_AI_TEAM\ElectricalPrice\Nolan\plots\xgboost_scatter.png', dpi=150)
 plt.show()
 
 plt.figure(figsize=(8, 5))
