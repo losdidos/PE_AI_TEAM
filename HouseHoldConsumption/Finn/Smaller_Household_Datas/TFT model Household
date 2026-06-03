@@ -1,0 +1,231 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # use first GPU only
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # silence TensorFlow noise
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 0. Imports
+# ──────────────────────────────────────────────────────────────────────────────
+import warnings
+warnings.filterwarnings("ignore")
+
+import torch
+torch.set_float32_matmul_precision('high')  # use Tensor Cores on RTX 4060
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from neuralforecast import NeuralForecast
+from neuralforecast.models import TFT
+from neuralforecast.losses.pytorch import MQLoss
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. Config
+# ──────────────────────────────────────────────────────────────────────────────
+DATA_PATH      = "household_weather.csv"  # adjust path if needed
+HORIZON        = 96      # steps to forecast  (96 × 15 min = 24 h)
+INPUT_SIZE     = 168     # context window     (168 × 15 min = 42 h)
+MAX_STEPS      = 750    # more steps for better convergence
+BATCH_SIZE     = 64      # larger batches = more stable on GPU
+LEARNING_RATE  = 1e-3
+HIDDEN_SIZE    = 64
+N_HEAD         = 4
+DROPOUT        = 0.1
+VAL_FRAC       = 0.15
+TEST_FRAC      = 0.25    # last ~6 months as test set
+FREQ           = "15min"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Load & prepare data
+# ──────────────────────────────────────────────────────────────────────────────
+print("Loading data ...")
+df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+df = df.sort_values("timestamp").reset_index(drop=True)
+
+df = df.rename(columns={"timestamp": "ds", "active_power": "y"})
+df["unique_id"] = "household"
+
+df["hour"]        = df["ds"].dt.hour
+df["day_of_week"] = df["ds"].dt.dayofweek
+df["month"]       = df["ds"].dt.month
+df["is_weekend"]  = (df["ds"].dt.dayofweek >= 5).astype(int)
+
+FUTR_EXOG = [
+    "temperature_2m", "relative_humidity_2m",
+    "snowfall", "rain",
+    "hour", "day_of_week", "month", "is_weekend",
+]
+
+print(f"Rows: {len(df):,}  |  {df['ds'].min()} -> {df['ds'].max()}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Train / validation / test split
+# ──────────────────────────────────────────────────────────────────────────────
+n        = len(df)
+n_test   = int(n * TEST_FRAC)
+n_val    = int(n * VAL_FRAC)
+n_train  = n - n_val - n_test
+
+train_df = df.iloc[:n_train + n_val].copy()
+test_df  = df.copy()
+
+print(f"Train+Val: {n_train + n_val:,} rows  |  Test: {n_test:,} rows")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Build TFT model
+#    - early_stop_patience_steps removed: neuralforecast's cross_validation
+#      refits the model internally and uses a different metric key, which
+#      caused the "ptl/val_loss not available" RuntimeError
+# ──────────────────────────────────────────────────────────────────────────────
+print("Building TFT model ...")
+print(f"GPU available: {torch.cuda.is_available()} ({'cuda' if torch.cuda.is_available() else 'cpu'}), used: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU name: {torch.cuda.get_device_name(0)}")
+
+model = TFT(
+    h                         = HORIZON,
+    input_size                = INPUT_SIZE,
+    hidden_size               = HIDDEN_SIZE,
+    n_head                    = N_HEAD,
+    dropout                   = DROPOUT,
+    futr_exog_list            = FUTR_EXOG,
+    loss                      = MQLoss(quantiles=[0.1, 0.5, 0.9]),
+    learning_rate             = LEARNING_RATE,
+    max_steps                 = MAX_STEPS,
+    batch_size                = BATCH_SIZE,
+    val_check_steps           = 50,
+    # early_stop_patience_steps intentionally omitted — causes metric key
+    # mismatch during cross_validation's internal refit
+    scaler_type               = "standard",
+    accelerator               = "gpu",
+    devices                   = 1,
+)
+
+nf = NeuralForecast(models=[model], freq=FREQ)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. Train
+# ──────────────────────────────────────────────────────────────────────────────
+print(f"Training for {MAX_STEPS} steps ... (watch GPU 3D utilisation in Task Manager)")
+nf.fit(df=train_df, val_size=n_val)
+print("Training complete.")
+
+print("Final training metrics:", nf.models[0].trainer.callback_metrics)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. Cross-validation predictions on test set (~6 months, 10 windows)
+# ──────────────────────────────────────────────────────────────────────────────
+print("Generating forecasts ...")
+preds = nf.cross_validation(
+    df        = test_df,
+    n_windows = 10,   # spread across ~6 month test set
+    step_size = HORIZON,
+)
+
+print("Prediction columns:", preds.columns.tolist())
+
+quant_cols = [c for c in preds.columns if c not in ["unique_id", "ds", "y", "cutoff"]]
+print("Quantile columns found:", quant_cols)
+quant_cols_sorted = sorted(quant_cols)
+lo_col     = quant_cols_sorted[0]   # 10th percentile
+median_col = quant_cols_sorted[1]   # 50th percentile
+hi_col     = quant_cols_sorted[2]   # 90th percentile
+
+actuals      = preds["y"].values
+median_preds = preds[median_col].values
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. Metrics
+# ──────────────────────────────────────────────────────────────────────────────
+mae  = mean_absolute_error(actuals, median_preds)
+rmse = np.sqrt(mean_squared_error(actuals, median_preds))
+mape = np.mean(np.abs((actuals - median_preds) / (actuals + 1e-8))) * 100
+
+print(f"\n{'='*40}")
+print(f"  Test MAE  : {mae:.2f} W")
+print(f"  Test RMSE : {rmse:.2f} W")
+print(f"  Test MAPE : {mape:.2f} %")
+print(f"{'='*40}\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. Plot 1 — Forecast vs Actuals (with uncertainty band)
+# ──────────────────────────────────────────────────────────────────────────────
+plot_steps = min(HORIZON * 7, len(preds))
+
+fig, ax = plt.subplots(figsize=(14, 5))
+ax.plot(preds["ds"].values[:plot_steps], actuals[:plot_steps],
+        label="Actual", color="steelblue", linewidth=1.2)
+ax.plot(preds["ds"].values[:plot_steps], median_preds[:plot_steps],
+        label="Forecast (median)", color="tomato", linewidth=1.2, linestyle="--")
+ax.fill_between(
+    preds["ds"].values[:plot_steps],
+    preds[lo_col].values[:plot_steps],
+    preds[hi_col].values[:plot_steps],
+    alpha=0.2, color="tomato", label="80% interval (10-90%)"
+)
+ax.set_title("TFT - Household Active Power Forecast")
+ax.set_xlabel("Time")
+ax.set_ylabel("Active Power (W)")
+ax.legend()
+plt.tight_layout()
+plt.savefig("tft_forecast.png", dpi=150)
+print("Forecast plot saved -> tft_forecast.png")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 9. Plot 2 — Linear Regression + Outlier Detection
+#    X axis: actual values
+#    Y axis: predicted values
+#    Points far from the regression line = outliers / hard-to-predict samples
+# ──────────────────────────────────────────────────────────────────────────────
+residuals      = actuals - median_preds
+std_residuals  = np.std(residuals)
+outlier_thresh = 2.5                               # standard deviations
+is_outlier     = np.abs(residuals) > outlier_thresh * std_residuals
+
+slope, intercept, r_value, p_value, _ = stats.linregress(actuals, median_preds)
+x_line = np.linspace(actuals.min(), actuals.max(), 200)
+y_line = slope * x_line + intercept
+
+fig2, ax2 = plt.subplots(figsize=(9, 8))
+
+ax2.scatter(actuals[~is_outlier], median_preds[~is_outlier],
+            alpha=0.3, s=8, color="steelblue", label="Normal predictions")
+
+ax2.scatter(actuals[is_outlier], median_preds[is_outlier],
+            alpha=0.8, s=20, color="tomato", label=f"Outliers (>{outlier_thresh}σ residual)  n={is_outlier.sum()}")
+
+ax2.plot(x_line, x_line, color="gray", linestyle=":", linewidth=1.2, label="Perfect fit (y=x)")
+
+ax2.plot(x_line, y_line, color="darkorange", linewidth=1.8,
+         label=f"Linear regression  (R²={r_value**2:.3f})")
+
+ax2.set_title("Predicted vs Actual — Linear Regression & Outlier Detection")
+ax2.set_xlabel("Actual Active Power (W)")
+ax2.set_ylabel("Predicted Active Power (W)")
+ax2.legend(fontsize=9)
+ax2.grid(True, alpha=0.3)
+
+# Annotate outlier stats
+textstr = (f"MAE  = {mae:.1f} W\n"
+           f"RMSE = {rmse:.1f} W\n"
+           f"R²   = {r_value**2:.3f}\n"
+           f"Outliers: {is_outlier.sum()} / {len(actuals)} "
+           f"({100*is_outlier.mean():.1f}%)")
+ax2.text(0.02, 0.97, textstr, transform=ax2.transAxes,
+         verticalalignment='top', fontsize=9,
+         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+plt.tight_layout()
+plt.savefig("tft_regression_outliers.png", dpi=150)
+print("Regression/outlier plot saved -> tft_regression_outliers.png")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 10. Save predictions to CSV
+# ──────────────────────────────────────────────────────────────────────────────
+preds.to_csv("tft_predictions.csv", index=False)
+print("Predictions saved -> tft_predictions.csv")
+
+plt.show()
