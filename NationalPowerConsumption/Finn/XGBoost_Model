@@ -1,0 +1,255 @@
+andas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from xgboost import XGBRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# =====================================================
+# 1. LOAD DATA
+# =====================================================
+
+df = pd.read_csv("electricity_consumption_ready.csv")
+
+# Parse datetime
+df["DateUTC"] = pd.to_datetime(df["DateUTC"], errors="coerce")
+
+# Clean numeric columns explicitly
+numeric_columns = ["Value", "temperature_2m"]
+
+for col in numeric_columns:
+    df[col] = (
+        df[col]
+        .astype(str)
+        .str.replace(",", ".", regex=False)
+        .str.replace(" ", "", regex=False)
+    )
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Remove rows with unparseable dates or values
+df = df.dropna(subset=["DateUTC"] + numeric_columns)
+
+# Sort by time
+df = df.sort_values("DateUTC").reset_index(drop=True)
+
+print(f"Rows after loading and cleaning: {len(df)}")
+
+# =====================================================
+# 2. FEATURE ENGINEERING
+# =====================================================
+
+# Time features
+df["hour"] = df["DateUTC"].dt.hour
+df["dayofweek"] = df["DateUTC"].dt.dayofweek
+df["month"] = df["DateUTC"].dt.month
+df["dayofyear"] = df["DateUTC"].dt.dayofyear
+df["weekofyear"] = df["DateUTC"].dt.isocalendar().week.astype(int)
+
+# Lag features
+# NOTE: lag_192 requires 192 previous rows (= 48 hours at 15-min resolution),
+# so the first ~192 rows will become NaN and be dropped below. This is expected.
+for lag in [1, 4, 96, 192]:
+    df[f"lag_{lag}"] = df["Value"].shift(lag)
+
+# Rolling features (shift(1) so we don't leak the current value)
+df["rolling_mean_96"] = df["Value"].shift(1).rolling(96).mean()
+df["rolling_std_96"] = df["Value"].shift(1).rolling(96).std()
+
+rows_before = len(df)
+df = df.dropna().reset_index(drop=True)
+rows_after = len(df)
+
+# These dropped rows are expected — they're the warm-up period for lag/rolling features
+print(f"Rows dropped due to lag/rolling warm-up: {rows_before - rows_after} (expected ~192)")
+print(f"Rows remaining for modelling: {rows_after}")
+
+# =====================================================
+# 3. DEFINE FEATURES
+# =====================================================
+
+features = [
+    "temperature_2m",
+    "hour",
+    "dayofweek",
+    "month",
+    "dayofyear",
+    "weekofyear",
+    "lag_1",
+    "lag_4",
+    "lag_96",
+    "lag_192",
+    "rolling_mean_96",
+    "rolling_std_96"
+]
+
+target = "Value"
+
+# Ensure everything is numeric
+for col in features + [target]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+df = df.dropna()
+
+X = df[features]
+y = df[target]
+
+print("\nData types going into XGBoost:")
+print(X.dtypes)
+
+# =====================================================
+# 4. TIME-BASED SPLIT
+# =====================================================
+
+split_index = int(len(df) * 0.8)
+
+X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+dates_test = df["DateUTC"].iloc[split_index:].reset_index(drop=True)
+
+# =====================================================
+# 5. TRAIN MODEL
+# =====================================================
+
+model = XGBRegressor(
+    n_estimators=500,
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    n_jobs=-1
+)
+
+model.fit(X_train, y_train)
+
+# =====================================================
+# 6. EVALUATE
+# =====================================================
+
+preds = model.predict(X_test)
+
+mae  = round(mean_absolute_error(y_test, preds), 3)
+rmse = round(np.sqrt(mean_squared_error(y_test, preds)), 3)
+
+print(f"\nModel Performance")
+print(f"MAE:  {mae}")
+print(f"RMSE: {rmse}")
+
+# =====================================================
+# 7. FORECAST NEXT YEAR
+# =====================================================
+
+forecast_steps = 365 * 96  # 15-minute resolution for one year
+
+last_known = df.copy()
+future_rows = []
+
+print(f"\nGenerating {forecast_steps:,} step forecast ({365} days × 96 steps/day)...")
+
+for i in range(forecast_steps):
+    if i % 5000 == 0:
+        print(f"  Step {i:,} / {forecast_steps:,}")
+
+    last_row = last_known.iloc[-1:].copy()
+
+    next_time = last_row["DateUTC"].values[0] + np.timedelta64(15, "m")
+    next_time = pd.to_datetime(next_time)
+
+    new_row = last_row.copy()
+    new_row["DateUTC"] = next_time
+
+    # Time features
+    new_row["hour"]       = next_time.hour
+    new_row["dayofweek"]  = next_time.dayofweek
+    new_row["month"]      = next_time.month
+    new_row["dayofyear"]  = next_time.dayofyear
+    new_row["weekofyear"] = next_time.isocalendar().week
+
+    # Lag updates
+    for lag in [1, 4, 96, 192]:
+        new_row[f"lag_{lag}"] = last_known["Value"].iloc[-lag]
+
+    # Rolling updates
+    new_row["rolling_mean_96"] = last_known["Value"].iloc[-96:].mean()
+    new_row["rolling_std_96"]  = last_known["Value"].iloc[-96:].std()
+
+    # Temperature: carry forward last known value
+    # (replace with an actual weather forecast if available for better accuracy)
+    new_row["temperature_2m"] = last_known["temperature_2m"].iloc[-1]
+
+    # Predict
+    prediction = model.predict(new_row[features])[0]
+    new_row["Value"] = prediction
+
+    future_rows.append({
+        "DateUTC":         next_time,
+        "Predicted_Value": round(float(prediction), 2)
+    })
+
+    last_known = pd.concat([last_known, new_row], ignore_index=True)
+
+future_df = pd.DataFrame(future_rows)
+future_df["DateUTC"] = pd.to_datetime(future_df["DateUTC"])
+
+print("Forecast complete.")
+
+# =====================================================
+# 8. PLOTS
+# =====================================================
+
+fig, axes = plt.subplots(3, 1, figsize=(16, 14))
+fig.suptitle("Electricity Consumption – Model & Forecast", fontsize=16, fontweight="bold", y=0.98)
+
+# ------ Plot 1: Test set – Actual vs Predicted ------
+ax1 = axes[0]
+
+# Downsample to daily means for readability (test set can be very dense at 15-min)
+test_df = pd.DataFrame({
+    "DateUTC": dates_test,
+    "Actual": y_test.values,
+    "Predicted": preds
+})
+test_daily = test_df.set_index("DateUTC").resample("D").mean()
+
+ax1.plot(test_daily.index, test_daily["Actual"],    label="Actual",    color="#1f77b4", linewidth=1.2)
+ax1.plot(test_daily.index, test_daily["Predicted"], label="Predicted", color="#ff7f0e", linewidth=1.2, linestyle="--")
+ax1.set_title(f"Test Set: Actual vs Predicted (daily mean)  |  MAE={mae}  RMSE={rmse}", fontsize=12)
+ax1.set_ylabel("Consumption")
+ax1.legend()
+ax1.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+ax1.xaxis.set_major_locator(mdates.MonthLocator())
+plt.setp(ax1.xaxis.get_majorticklabels(), rotation=30, ha="right")
+ax1.grid(True, alpha=0.3)
+
+# ------ Plot 2: Full historical + forecast (daily mean) ------
+ax2 = axes[1]
+
+hist_daily = df[["DateUTC", "Value"]].set_index("DateUTC").resample("D").mean()
+fore_daily = future_df.set_index("DateUTC")["Predicted_Value"].resample("D").mean()
+
+ax2.plot(hist_daily.index, hist_daily["Value"],   label="Historical", color="#1f77b4", linewidth=1.0)
+ax2.plot(fore_daily.index, fore_daily.values,     label="Forecast",   color="#d62728", linewidth=1.0, linestyle="--")
+ax2.axvline(x=df["DateUTC"].iloc[-1], color="gray", linestyle=":", linewidth=1.5, label="Forecast start")
+ax2.set_title("Full History + 1-Year Forecast (daily mean)", fontsize=12)
+ax2.set_ylabel("Consumption")
+ax2.legend()
+ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+ax2.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+plt.setp(ax2.xaxis.get_majorticklabels(), rotation=30, ha="right")
+ax2.grid(True, alpha=0.3)
+
+# ------ Plot 3: Feature importance ------
+ax3 = axes[2]
+
+importances = pd.Series(model.feature_importances_, index=features).sort_values(ascending=True)
+colors = ["#1f77b4" if v < importances.median() else "#ff7f0e" for v in importances]
+importances.plot(kind="barh", ax=ax3, color=colors, edgecolor="white")
+ax3.set_title("XGBoost Feature Importance", fontsize=12)
+ax3.set_xlabel("Importance score")
+ax3.grid(True, axis="x", alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("electricity_forecast.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("\nPlot saved to electricity_forecast.png")
