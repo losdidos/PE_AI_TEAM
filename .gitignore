@@ -1,0 +1,14 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+.env/
+virtualenv/
+.virtualenv/
+
+Pipfile.lock
+
+poetry.lock
+
+.conda/
