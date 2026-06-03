@@ -1,2 +1,2 @@
 # ElectricalPrice - Winston
-This parity plot was made by me, but the model it belongs to was made by Nolan.
+The parity plots were made by me, but the models they belong to were made by Nolan.
