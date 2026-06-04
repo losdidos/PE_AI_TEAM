@@ -1,0 +1,5 @@
+https://ukerc.rl.ac.uk/cgi-bin/dataDiscover.pl?Action=detail&dataid=7d78f943-f9fe-413b-af52-1816f9d968b0
+
+https://archive.ics.uci.edu/dataset/235/individual+household+electric+power+consumption
+
+https://pureportal.strath.ac.uk/en/datasets/refit-electrical-load-measurements-cleaned/
