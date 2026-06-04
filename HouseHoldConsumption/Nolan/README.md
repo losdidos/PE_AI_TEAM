@@ -1,1 +1,0 @@
-# HouseHoldConsumption - Nolan
