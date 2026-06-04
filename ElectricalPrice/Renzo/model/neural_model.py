@@ -49,8 +49,6 @@ y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
 print(f"Features: {X.shape[1]}")
 
 # ── 3. SLIDING WINDOW
-# WaveNet needs a power-of-2 window to match the dilation stack nicely
-# 2^7 = 128 steps = 32h at 15min
 WINDOW = 128
 
 def make_sequences(X, y, window):
@@ -70,14 +68,6 @@ y_train, y_test = y_seq[:split], y_seq[split:]
 test_dates = df['DateUTC'].iloc[split + WINDOW:]
 
 print(f"Train: {len(X_train)} | Test: {len(X_test)}")
-
-# ── 5. WAVENET MODEL
-# Stack dilated causal Conv1D layers with doubling dilation rates
-# Each layer sees exponentially further back in time:
-#   dilation 1  → looks 1 step back
-#   dilation 2  → looks 2 steps back
-#   dilation 4  → looks 4 steps back ... up to 64 = 128 steps total
-# Residual connections let gradients flow cleanly through deep stacks
 
 def wavenet_block(x, filters, dilation_rate):
     """Single WaveNet block with residual connection (Géron fig 15-11)"""
