@@ -1,1 +1,0 @@
-# NationalPowerConsumption - Ise
